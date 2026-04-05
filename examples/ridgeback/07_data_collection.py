@@ -1,42 +1,59 @@
-"""Stage 7 — Teleoperation data collection.
+"""Stage 7 — Human teleoperation data collection.
 
-Drives the arm along a small circular trajectory while recording:
-  - Robot state (joint positions/velocities, EE pose, gripper position)
-  - RGBD frames from one or more Orbbec cameras
-  - Commanded actions (EE pose targets)
+Records one or more episodes of human-controlled arm motion alongside
+synchronized multi-camera RGBD data.  Designed for collecting demonstration
+data for imitation learning.
 
-Data is saved per episode to a directory on disk in .npz + .json format:
+Control modes
+-------------
+* **Keyboard** (``--input keyboard``, default):
+  WASD + arrows move the EE in Cartesian space.  No extra dependencies.
 
-    <output_dir>/
-        episode_0000/
-            info.json        — metadata, camera intrinsics, timing
-            state.npz        — joints, velocities, EE pose, gripper, actions
-            cam_camera.npz   — color (N,H,W,3), depth (N,H,W), timestamps
+* **SpaceMouse** (``--input spacemouse``):
+  6-DOF analogue input from a 3Dconnexion SpaceMouse.
+  Requires:  ``pip install pyspacemouse``
 
-This script uses the CartesianController for smooth streaming control.
-The controller is activated/deactivated programmatically.
+Key bindings (keyboard mode)
+-----------------------------
+  W/S    →  EE +X / -X        (forward/backward)
+  A/D    →  EE -Y / +Y        (left/right)
+  Q/E    →  EE +Z / -Z        (up/down)
+  ↑/↓    →  pitch +/-
+  ←/→    →  yaw +/-
+  R/F    →  roll +/-
+  O/C    →  gripper open/close
+  Space  →  stop episode (save)
+  X      →  discard episode
+  Esc    →  quit program
 
-Prerequisites:
-    1. Robot bringup (or simulation) is running.
-    2. Orbbec driver is running:
-         pixi run ros2 launch tum09_custom orbbec.launch.py
-    3. Run 01_home.py first to confirm the arm is at a safe home pose.
+Data saved per episode
+----------------------
+  <output_dir>/episode_NNNN/
+    info.json      — metadata, camera intrinsics
+    state.npz      — joints, EE pose, gripper, commanded actions, timestamps
+    cam_<name>.npz — color (N,H,W,3) uint8, depth (N,H,W) float32, stamps
 
-Usage:
-    cd /home/yunfei/crisp_py
+Prerequisites
+-------------
+  1. Robot bringup (or simulation) is running.
+  2. Orbbec driver is running (if cameras are used):
+       pixi run ros2 launch tum09_custom orbbec.launch.py
+  3. Run ``01_home.py`` first to confirm the arm is at home.
 
-    # Real robot — single camera, one episode
-    pixi run --environment jazzy python3 examples/ridgeback/07_data_collection.py
+Usage
+-----
+  cd /home/yunfei/crisp_py
 
-    # Real robot — two cameras, five episodes, custom output dir
-    pixi run --environment jazzy python3 examples/ridgeback/07_data_collection.py \\
-        --namespaces /camera_01 /camera_02 \\
-        --episodes 5 \\
-        --output ~/data/ridgeback_episodes
+  # Keyboard, real robot, single camera
+  pixi run --environment jazzy python3 examples/ridgeback/07_data_collection.py
 
-    # Simulation (no cameras needed, no gripper)
-    pixi run --environment jazzy python3 examples/ridgeback/07_data_collection.py \\
-        --sim --namespaces
+  # SpaceMouse, two cameras, five episodes
+  pixi run --environment jazzy python3 examples/ridgeback/07_data_collection.py \\
+      --input spacemouse --namespaces /camera_01 /camera_02 --episodes 5
+
+  # Simulation (no cameras, keyboard)
+  pixi run --environment jazzy python3 examples/ridgeback/07_data_collection.py \\
+      --sim --namespaces
 """
 
 import argparse
@@ -47,6 +64,7 @@ import numpy as np
 from crisp_py.camera import RgbdCameraConfig, make_rgbd_cameras
 from crisp_py.data import DataCollector
 from crisp_py.robot import RidgebackConfig, make_ridgeback_robot, get_ridgeback_urdf_path
+from crisp_py.teleop import apply_delta
 
 CLEARPATH_WS = "/home/yunfei/clearpath_remote_ws"
 SIM_URDF = f"{CLEARPATH_WS}/src/tum09_ridgeback/tum09_bringup/config/robot.urdf"
@@ -54,8 +72,17 @@ SIM_URDF = f"{CLEARPATH_WS}/src/tum09_ridgeback/tum09_bringup/config/robot.urdf"
 # --------------------------------------------------------------------------- #
 # Parse arguments
 # --------------------------------------------------------------------------- #
-parser = argparse.ArgumentParser(description="Stage 7: teleoperation data collection")
+parser = argparse.ArgumentParser(
+    description="Stage 7: human teleoperation data collection",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+)
 parser.add_argument("--sim", action="store_true", help="Use simulation config")
+parser.add_argument(
+    "--input",
+    choices=["keyboard", "spacemouse"],
+    default="keyboard",
+    help="Teleoperation input device (default: keyboard)",
+)
 parser.add_argument(
     "--namespaces",
     nargs="*",
@@ -75,7 +102,7 @@ parser.add_argument(
     "--episodes",
     type=int,
     default=1,
-    help="Number of episodes to collect (default: 1)",
+    help="Maximum number of episodes to collect (default: 1)",
 )
 parser.add_argument(
     "--hz",
@@ -84,16 +111,16 @@ parser.add_argument(
     help="Control loop frequency [Hz] (default: 20)",
 )
 parser.add_argument(
-    "--duration",
+    "--pos-scale",
     type=float,
-    default=10.0,
-    help="Duration of each episode [s] (default: 10)",
+    default=0.005,
+    help="EE position increment per key-press [m] (keyboard mode, default: 0.005)",
 )
 parser.add_argument(
-    "--radius",
+    "--rot-scale",
     type=float,
-    default=0.03,
-    help="Circle radius for test trajectory [m] (default: 0.03)",
+    default=0.02,
+    help="EE rotation increment per key-press [rad] (keyboard mode, default: 0.02)",
 )
 parser.add_argument(
     "--camera-timeout",
@@ -104,10 +131,9 @@ parser.add_argument(
 args = parser.parse_args()
 
 env_str = "SIMULATION" if args.sim else "REAL ROBOT"
-print(f"Mode: {env_str}")
+print(f"Mode: {env_str}  |  Input: {args.input}  |  {args.hz:.0f} Hz")
 print(f"Cameras: {args.namespaces if args.namespaces else 'none'}")
 print(f"Output:  {args.output}")
-print(f"Episodes: {args.episodes}  |  {args.hz:.0f} Hz  |  {args.duration}s each")
 
 # --------------------------------------------------------------------------- #
 # Connect to robot
@@ -119,13 +145,13 @@ else:
     cfg = RidgebackConfig.for_real_robot()
     urdf = get_ridgeback_urdf_path(CLEARPATH_WS)
 
-print("\nLoading URDF and connecting to robot...")
+print("\nConnecting to robot...")
 robot = make_ridgeback_robot(urdf_path=urdf, config=cfg)
 robot.wait_until_ready(timeout=15.0)
 print("Robot ready.")
 
 # --------------------------------------------------------------------------- #
-# Connect to cameras (optional)
+# Connect to cameras
 # --------------------------------------------------------------------------- #
 cameras = []
 if args.namespaces:
@@ -145,7 +171,22 @@ collector = DataCollector(
     cameras=cameras,
     output_dir=args.output,
 )
-print(f"\nDataCollector: {collector}")
+
+# --------------------------------------------------------------------------- #
+# Build teleoperation input
+# --------------------------------------------------------------------------- #
+if args.input == "spacemouse":
+    from crisp_py.teleop import SpaceMouseTeleopInput
+    teleop_input = SpaceMouseTeleopInput(
+        pos_scale=args.pos_scale * args.hz,   # scale to per-tick delta
+        rot_scale=args.rot_scale * args.hz,
+    )
+else:
+    from crisp_py.teleop import KeyboardTeleopInput
+    teleop_input = KeyboardTeleopInput(
+        pos_scale=args.pos_scale,
+        rot_scale=args.rot_scale,
+    )
 
 # --------------------------------------------------------------------------- #
 # Home the robot
@@ -157,84 +198,114 @@ if not robot.is_homed():
 print("At home.")
 
 # --------------------------------------------------------------------------- #
-# Episode loop
+# Activate CartesianController
+# --------------------------------------------------------------------------- #
+print("Activating CartesianController for teleoperation...")
+if not robot.switch_to_cartesian_controller():
+    raise RuntimeError(
+        "Failed to activate CartesianController. "
+        "Check that crisp_controllers are loaded."
+    )
+print("CartesianController active.")
+
+# --------------------------------------------------------------------------- #
+# Episode collection loop
 # --------------------------------------------------------------------------- #
 dt = 1.0 / args.hz
-circle_freq = 0.2   # one full circle every 5 s
+episodes_done = 0
 
-for ep_idx in range(args.episodes):
-    print(f"\n{'='*55}")
-    print(f"Episode {ep_idx + 1} / {args.episodes}")
-    print(f"{'='*55}")
+with teleop_input:
+    if hasattr(teleop_input, "help_text"):
+        print(teleop_input.help_text())
 
-    # Record the current EE pose as the circle centre
-    centre_pose = robot.end_effector_pose
-    centre_y = centre_pose.position[1]
-    centre_z = centre_pose.position[2]
-    print(f"Circle centre (EE at home): {np.round(centre_pose.position, 4)}")
+    print(
+        f"\nReady to collect. Use the input device to control the arm.\n"
+        f"Press Space to save an episode, X to discard, Esc to quit.\n"
+    )
 
-    # Activate CartesianController for smooth streaming
-    print("Activating CartesianController...")
-    if not robot.switch_to_cartesian_controller():
-        raise RuntimeError(
-            "Failed to activate CartesianController. "
-            "Check that crisp_controllers are loaded in the bringup."
-        )
+    # Start with the current EE pose as the Cartesian target
+    target_pose = robot.end_effector_pose
 
-    # Start recording
-    episode_id = collector.start_episode()
-    print(f"Recording episode: {episode_id}")
+    while episodes_done < args.episodes:
+        # Start a new episode
+        episode_id = collector.start_episode()
+        print(f"\n--- Recording episode: {episode_id} ---")
 
-    n_steps = int(args.duration * args.hz)
+        episode_saved = False
+        t_start = time.monotonic()
 
-    try:
-        for step in range(n_steps):
-            t = step * dt
-            angle = 2.0 * np.pi * circle_freq * t
+        while True:
+            t_tick = time.monotonic()
 
-            # Compute target pose (circle in YZ plane)
-            target = centre_pose.copy()
-            target.position[1] = centre_y + args.radius * np.cos(angle)
-            target.position[2] = centre_z + args.radius * np.sin(angle)
+            # Read input device
+            cmd = teleop_input.poll()
 
-            # Send command to robot
-            robot.move_cartesian_async(target)
+            # Handle episode / program control
+            if cmd.quit:
+                print("\nQuit requested.")
+                if collector.is_recording:
+                    collector.discard_episode()
+                break
 
-            # Record this step (state + action + camera frames)
-            collector.record_step(action=target)
+            if cmd.discard_episode:
+                print("Episode discarded.")
+                collector.discard_episode()
+                episode_saved = False
+                break
 
-            # Throttle to loop frequency
-            time.sleep(dt)
+            if cmd.stop_episode:
+                saved_path = collector.stop_episode()
+                print(
+                    f"Episode saved ({collector.last_episode_steps} steps) "
+                    f"→ {saved_path}"
+                )
+                episodes_done += 1
+                episode_saved = True
+                break
 
-        print(
-            f"Episode done: {collector.current_episode_steps} steps recorded."
-        )
+            # Apply delta to get new target pose
+            if np.any(cmd.pos_delta != 0.0) or np.any(cmd.rot_delta != 0.0):
+                target_pose = apply_delta(target_pose, cmd)
 
-    except KeyboardInterrupt:
-        print("\nEpisode aborted by user.")
-        collector.discard_episode()
-        robot.switch_to_joint_trajectory_controller()
-        print("JointTrajectoryController restored. Exiting.")
-        break
+            # Gripper command
+            if cmd.gripper < -0.5:
+                robot.gripper_open()
+            elif cmd.gripper > 0.5:
+                robot.gripper_close()
 
-    finally:
-        # Always restore joint trajectory controller
-        robot.switch_to_joint_trajectory_controller()
-        print("JointTrajectoryController restored.")
+            # Send Cartesian command to robot
+            robot.move_cartesian_async(target_pose)
 
-    # Save episode to disk
-    if collector.is_recording:
-        saved_path = collector.stop_episode()
-        print(f"Saved {collector.last_episode_steps} steps → {saved_path}")
+            # Record this step
+            collector.record_step(action=target_pose)
 
-    # Return to home between episodes
-    if ep_idx < args.episodes - 1:
-        print("Returning to home for next episode...")
-        robot.home(duration=6.0)
+            # Status every 2 seconds
+            elapsed = time.monotonic() - t_start
+            if int(elapsed) % 2 == 0 and int(elapsed * args.hz) % int(args.hz * 2) == 0:
+                ee = robot.end_effector_pose
+                print(
+                    f"  t={elapsed:.0f}s  steps={collector.current_episode_steps}"
+                    f"  EE={np.round(ee.position, 3)}"
+                )
+
+            # Sleep for remainder of tick
+            tick_elapsed = time.monotonic() - t_tick
+            sleep_time = dt - tick_elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        if cmd.quit:
+            break
+
+        if not episode_saved:
+            # Offer to re-record
+            print("Episode discarded. Start next episode? (press any key to continue)")
 
 # --------------------------------------------------------------------------- #
-# Summary
+# Cleanup
 # --------------------------------------------------------------------------- #
-print(f"\n{'='*55}")
-print(f"Collection complete.")
-print(f"Output directory: {args.output}")
+print("\nRestoring JointTrajectoryController...")
+robot.switch_to_joint_trajectory_controller()
+print("JointTrajectoryController restored.")
+
+print(f"\nCollection complete. {episodes_done} episode(s) saved to {args.output}")
