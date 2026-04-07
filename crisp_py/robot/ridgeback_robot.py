@@ -210,7 +210,7 @@ class RidgebackConfig:
             joint_states_topic="/joint_states",
             arm_action="/joint_trajectory_controller/follow_joint_trajectory",
             gripper_action=None,
-            cartesian_target_topic="/cartesian_controller/target_pose",
+            cartesian_target_topic="/target_pose",
             controller_manager_topic="/controller_manager",
             joint_trajectory_controller_name="joint_trajectory_controller",
         )

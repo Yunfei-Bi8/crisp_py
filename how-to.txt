@@ -1,0 +1,2 @@
+cd crisp_py
+pixi shell -e humble #activate the env in pixi named "humble"

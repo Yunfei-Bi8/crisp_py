@@ -14,7 +14,7 @@ supported arm control modes:
 import threading
 from typing import List, Optional
 
-from controller_manager_msgs.srv import SwitchController
+from controller_manager_msgs.srv import ListControllers, SwitchController
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
 
@@ -61,8 +61,14 @@ class RidgebackControllerSwitcher:
                 f"{ns}/switch_controller",
                 callback_group=ReentrantCallbackGroup(),
             )
+            self._list_client = node.create_client(
+                ListControllers,
+                f"{ns}/list_controllers",
+                callback_group=ReentrantCallbackGroup(),
+            )
         else:
             self._client = None
+            self._list_client = None
 
     # ------------------------------------------------------------------ #
     #  Internal                                                            #
@@ -118,6 +124,29 @@ class RidgebackControllerSwitcher:
             )
         return ok_box[0]
 
+    def _get_active_controllers(self) -> List[str]:
+        """Return names of currently active controllers. Returns [] on failure."""
+        if self._list_client is None:
+            return []
+        if not self._list_client.wait_for_service(timeout_sec=self._service_timeout):
+            return []
+        done = threading.Event()
+        result_box: List[List[str]] = [[]]
+
+        def _cb(future):
+            try:
+                resp = future.result()
+                result_box[0] = [
+                    c.name for c in resp.controller if c.state == "active"
+                ]
+            except Exception:
+                pass
+            done.set()
+
+        self._list_client.call_async(ListControllers.Request()).add_done_callback(_cb)
+        done.wait(timeout=self._service_timeout + 1.0)
+        return result_box[0]
+
     # ------------------------------------------------------------------ #
     #  Public: transitions                                                 #
     # ------------------------------------------------------------------ #
@@ -125,12 +154,22 @@ class RidgebackControllerSwitcher:
     def switch_to_cartesian(self) -> bool:
         """Deactivate JointTrajectoryController and activate CartesianController.
 
+        Idempotent: returns True immediately if CartesianController is already active.
+
         Returns:
-            True if the controller_manager accepted the request.
+            True if the controller_manager accepted the request (or no-op needed).
         """
+        active = self._get_active_controllers()
+        if self._cartesian_name in active:
+            self._node.get_logger().info(
+                f"CartesianController ('{self._cartesian_name}') is already active — no switch needed."
+            )
+            return True
+
+        to_deactivate = [self._jtc_name] if self._jtc_name in active else []
         ok = self._call_switch(
             activate=[self._cartesian_name],
-            deactivate=[self._jtc_name],
+            deactivate=to_deactivate,
         )
         if ok:
             self._node.get_logger().info(
@@ -145,12 +184,22 @@ class RidgebackControllerSwitcher:
     def switch_to_joint_trajectory(self) -> bool:
         """Deactivate CartesianController and restore JointTrajectoryController.
 
+        Idempotent: returns True immediately if JointTrajectoryController is already active.
+
         Returns:
-            True if the controller_manager accepted the request.
+            True if the controller_manager accepted the request (or no-op needed).
         """
+        active = self._get_active_controllers()
+        if self._jtc_name in active:
+            self._node.get_logger().info(
+                f"JointTrajectoryController ('{self._jtc_name}') is already active — no switch needed."
+            )
+            return True
+
+        to_deactivate = [self._cartesian_name] if self._cartesian_name in active else []
         ok = self._call_switch(
             activate=[self._jtc_name],
-            deactivate=[self._cartesian_name],
+            deactivate=to_deactivate,
         )
         if ok:
             self._node.get_logger().info(
