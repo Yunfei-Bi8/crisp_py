@@ -191,17 +191,19 @@ class SpaceMouseTeleopInput(TeleopInput):
 
             # SpaceMouse axes: x=left/right, y=forward/back, z=up/down,
             # roll, pitch, yaw (all in device frame).
-            # Map device frame → robot base_link frame deltas:
+            # Map device frame → robot base_link frame deltas
+            # (matches clearpath spacemouse_ros2 convention):
             #   device +x → robot +Y (rightward in base frame)
-            #   device +y → robot +X (forward in base frame)
+            #   device +y → robot -X (negated to match ROS X-forward convention)
             #   device +z → robot +Z (upward)
+            #   rotations all negated to match clearpath convention
             with self._lock:
-                self._pos_acc[0] += self._dead(state.y) * self._pos_scale
+                self._pos_acc[0] += -self._dead(state.y) * self._pos_scale
                 self._pos_acc[1] += self._dead(state.x) * self._pos_scale
                 self._pos_acc[2] += self._dead(state.z) * self._pos_scale
-                self._rot_acc[0] += self._dead(state.roll)  * self._rot_scale
-                self._rot_acc[1] += self._dead(state.pitch) * self._rot_scale
-                self._rot_acc[2] += self._dead(state.yaw)   * self._rot_scale
+                self._rot_acc[0] += -self._dead(state.roll)  * self._rot_scale
+                self._rot_acc[1] += -self._dead(state.pitch) * self._rot_scale
+                self._rot_acc[2] += -self._dead(state.yaw)   * self._rot_scale
 
                 # Buttons (one-shot on press)
                 if self._button_stop >= 0 and len(state.buttons) > self._button_stop:
